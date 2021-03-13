@@ -1,0 +1,239 @@
+---
+title: "Previsioni morti Covid per il Veneto"
+author: Gabriele Carrara, matricola 814720; Davide Porcellini, matricola 816586; Simone
+  Tufano, matricola 816984
+date: "06 maggio 2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr) 
+library(ggplot2)
+library(lubridate)
+```
+
+
+```{r}
+data <- read.csv('comune_giorno.csv')
+```
+
+Si opta per la stima dei morti per la Regione Veneto
+
+```{r}
+data_veneto <- data[which(data$NOME_REGIONE == 'Veneto'),]
+```
+
+Si verifica che siano presenti tutti i comuni del Veneto
+
+```{r}
+length(unique(data_veneto$NOME_COMUNE))
+```
+
+Il numero coincide con i comuni ufficiali. Si procede eliminando le colonne non necessarie per l'analisi.
+
+```{r}
+data_veneto <- data_veneto[,c(3:9,22:27)]
+```
+
+Si trasforma la data in un formato piu' corretto e si elimina la variabile GE.
+
+```{r}
+data_veneto %>% mutate(DATA = as.Date(paste0("0", GE, "2020"), format = "%m%d%Y")) -> data_veneto 
+```
+
+
+```{r}
+data_veneto <- data_veneto[,-7]
+```
+
+si separano le variabili SESSO e ANNO e si rende il dataset verticale.
+
+```{r}
+data_veneto <- data_veneto %>%
+  gather(key = "SESSO_ANNO", value = "DECESSI", TOTALE_15:TOTALE_20)
+
+data_veneto %>% separate(SESSO_ANNO, c("SESSO", "ANNO"), "_") -> data_veneto
+```
+
+```{r}
+summary(data_veneto)
+```
+
+Si trasforma la variabile DATA e si unisce con la variabile ANNO.
+
+```{r}
+data_dmy <- paste0((paste(day(data_veneto$DATA), lubridate::month(data_veneto$DATA),'20', sep = '/')), data_veneto$ANNO)
+```
+
+Si trasforma la variabile precedente in un formato data corretto.
+
+```{r, warning=FALSE, message=FALSE}
+data_veneto$DATA <- lubridate::dmy(data_dmy)
+```
+
+```{r}
+summary(data_veneto)
+```
+
+Si eliminano le variabili inutili per le analisi.
+
+```{r}
+data_veneto <- data_veneto[,-c(1,9)]
+```
+
+Si costruisce il nuovo dataframe con i dati aggregati per data e comune per eliminare la componente "classi eta'".
+
+```{r}
+data_veneto_gb <- data_veneto %>% 
+  group_by(DATA, NOME_COMUNE) %>%
+  summarize(DECESSI = sum(DECESSI)) 
+```
+
+Dataset orizzontale per sistemare le date mancanti.
+
+```{r}
+data_veneto_spread <- data_veneto_gb %>%
+  spread(key = "DATA", value = "DECESSI")
+```
+
+Vengono sostituiti i valori mancanti con 0.
+
+```{r}
+data_veneto_spread[is.na(data_veneto_spread)] <- 0
+```
+
+Una volta inseriti gli 0 al posto dei valori mancanti si torna al dataset tidy
+
+```{r}
+data_veneto_tidy <- data_veneto_spread %>%
+  gather(key = "DATA", value = "DECESSI", `2015-01-01`:`2020-04-30`)
+data_veneto_tidy<- data_veneto_tidy[-2]
+```
+
+si estraggono i comuni
+
+```{r}
+comuni <- data_veneto_tidy %>%
+  .$NOME_COMUNE %>%
+  unique()
+```
+
+Si crea la finestra previsionale (primi 3 mesi 2020) e la lista che conterra' i risultati
+
+```{r}
+giorni_previsione <- 91 
+finestra_prev <- as.Date("2019-12-31") %m+% days(1:giorni_previsione) 
+all_pred <- list()
+```
+
+Tramite un modello auto arima si stimano i morti per comune
+
+```{r, warning=FALSE, message=FALSE}
+for (i in 1:length(comuni)) {
+
+  current_comune <- comuni[i]
+  
+  pred_death <- data_veneto_tidy %>%
+    filter(NOME_COMUNE == current_comune &
+           DATA<= as.Date("2019-12-31")) %>%
+    arrange(DATA) %>%
+    .$DECESSI %>%
+    ts(frequency = 365) %>%
+    forecast::auto.arima() %>%
+    forecast::forecast(h = giorni_previsione)
+  
+  out_pred <- tibble(NOME_COMUNE = rep(current_comune, giorni_previsione),
+                     DATA = finestra_prev,
+                     PREVISIONE = pred_death$mean)
+  
+  all_pred[[i]] <- out_pred
+}
+
+```
+
+Si uniscono tutte le previsioni
+
+```{r, warning=FALSE, message=FALSE}
+previsioni_veneto<- bind_rows(all_pred)
+```
+
+Esempio di una previsione 
+
+```{r}
+plot(all_pred[[1]][2:3], type= 'l', main = "Abano Terme")
+```
+
+Si nota che il valore puntuale della stima si avvicina nel tempo alla media, tuttavia mantiene una quota di varianza lungo tutta la finestra previsionale. Si opta per non arrotondare la cifra stimata per evitare di introdurre un Bias sistematico.
+
+Si aggiunge la colonna relativa ai decessi effettivi per il 2020
+
+```{r}
+confronto<- merge(previsioni_veneto, filter(data_veneto_tidy, DATA >= "2019-12-31" & DATA <= "2020-03-31") , by= c("NOME_COMUNE", "DATA"))
+head(confronto)
+```
+
+Si unisce la provincia al dataset. Questo al fine di applicare ai comuni in cui non sono presenti i dati un tasso d'incremento provinciale
+
+```{r}
+comune_provincia<-unique(data_veneto[c("NOME_COMUNE", "NOME_PROVINCIA")])
+confronto<- merge(confronto, comune_provincia, by= "NOME_COMUNE")
+head(confronto)
+```
+
+
+```{r}
+comune_presenza_dati<- unique(data_veneto[c("NOME_COMUNE", "DATA_INIZIO_DIFF")])
+confronto<- merge(confronto, comune_presenza_dati, by= "NOME_COMUNE")
+```
+
+Si crea il dataset per stimare il tasso d'incremento dei decessi reali rispetto agli stimati dove si hanno dati certi per provincia
+
+```{r}
+tasso<- confronto%>%
+  filter(DECESSI<5000)%>%
+  filter(DATA_INIZIO_DIFF!= "Dati 2020 n.d.")%>%
+  group_by(NOME_PROVINCIA)%>%
+  summarise(SOMMA_DECESSI=sum(DECESSI), SOMMA_PREVISTI=sum(PREVISIONE))
+head(tasso)
+```
+
+Si calcola il tasso in questione
+
+```{r}
+tasso$tasso_incremento<- tasso$SOMMA_DECESSI/tasso$SOMMA_PREVISTI
+head(tasso)
+```
+
+Si nota che il numero di decessi e' maggiore in ogni provincia ma il valore del tasso non e' molto elevato
+
+```{r}
+confronto<- merge(confronto, tasso, by= "NOME_PROVINCIA")
+```
+
+Dove non erano presenti i dati si stimano i decessi moltiplicando le previsioni del paese per il tasso provinciale
+
+```{r}
+da_prevedere<- confronto %>%
+  filter(DATA_INIZIO_DIFF== "Dati 2020 n.d.")
+da_prevedere$DECESSI<- da_prevedere$PREVISIONE* da_prevedere$tasso_incremento
+```
+
+Si uniscono i risultati
+
+```{r}
+altri<- confronto %>%
+  filter(DATA_INIZIO_DIFF!= "Dati 2020 n.d.")
+data_finale<-bind_rows(altri, da_prevedere)
+```
+
+```{r}
+colSums(data_finale[4:5])
+```
+
+```{r, echo=FALSE}
+paste("Il numero di morti da noi stimato per il Veneto ?" , round(15698.64- 13218.42), "mentre il numero ufficiale ? 1565 al 6/05")
+```
+
